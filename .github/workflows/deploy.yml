@@ -1,0 +1,87 @@
+# DEPLOY + SMOKE TEST + AUTO-ROLLBACK
+# Every push to main is tested, deployed to GitHub Pages ("production" for this sandbox),
+# then smoke-tested. If the smoke test fails, the commit is reverted, which redeploys the previous version.
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements-dev.txt
+      - run: ruff check . && pytest -q
+      - run: python scripts/build_site.py
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: production
+      url: ${{ steps.pages.outputs.page_url }}
+    outputs:
+      url: ${{ steps.pages.outputs.page_url }}
+    steps:
+      - id: pages
+        uses: actions/deploy-pages@v4
+
+  smoke:
+    needs: deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Check production serves this commit
+        env:
+          URL: ${{ needs.deploy.outputs.url }}
+        run: |
+          want=$(echo "$GITHUB_SHA" | cut -c1-7)
+          for i in $(seq 1 12); do
+            body=$(curl -fsS "${URL%/}/health.txt?nocache=$RANDOM" || true)
+            echo "attempt $i: $body"
+            case "$body" in ok*"$want"*) echo "✅ production is healthy on $want"; exit 0 ;; esac
+            sleep 10
+          done
+          echo "❌ production did not report $want"; exit 1
+
+  rollback:
+    needs: smoke
+    # Only when the smoke test itself failed, and never revert a revert (prevents a rollback loop).
+    if: failure() && needs.smoke.result == 'failure' && !startsWith(github.event.head_commit.message, 'Revert')
+    runs-on: ubuntu-latest
+    permissions: {}
+    env:
+      GH_TOKEN: ${{ secrets.AGENT_GH_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.AGENT_GH_TOKEN }}
+          fetch-depth: 2
+      - name: Revert the bad commit (triggers a redeploy of the previous version)
+        run: |
+          git config user.name "deploy-agent"
+          git config user.email "deploy-agent@users.noreply.github.com"
+          git revert --no-edit "$GITHUB_SHA"
+          git push origin HEAD:main
+          gh issue create --title "Auto-rollback of ${GITHUB_SHA:0:7}" --label needs-human \
+            --body "Smoke test failed after deploying $GITHUB_SHA, so it was reverted. Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"

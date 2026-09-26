@@ -1,0 +1,202 @@
+# REVIEWER AGENT (+ fix loop)
+# Trigger: any PR from an `agent/*` branch is opened or updated.
+#
+#   guard  ──▶ review ──▶ APPROVE ─────────────▶ agent-review check ✅ ──▶ auto-merge (with CI ✅)
+#                     └─▶ REQUEST_CHANGES ─┬─▶ fix (coder pushes) ──▶ this workflow runs again
+#                                          └─▶ after MAX_FIX_ROUNDS: label needs-human, stop
+#
+# Branch protection must require the `ci` and `agent-review` checks (scripts/setup_repo.sh does it).
+name: Reviewer agent
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  group: review-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+env:
+  GH_TOKEN: ${{ secrets.AGENT_GH_TOKEN }}
+  PR: ${{ github.event.pull_request.number }}
+  BASE_SHA: ${{ github.event.pull_request.base.sha }}
+  HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+  MAX_FIX_ROUNDS: "3"
+  # Paths only a human may change. Keep in sync with CLAUDE.md.
+  OFF_LIMITS: '^(\.github/|CLAUDE\.md$|scripts/(setup_repo|bootstrap)\.sh$)'
+
+jobs:
+  guard:
+    if: startsWith(github.head_ref, 'agent/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+      - name: Block off-limits paths
+        run: |
+          changed=$(git diff --name-only "$(git merge-base "$BASE_SHA" "$HEAD_SHA")" "$HEAD_SHA")
+          echo "Changed files:"; echo "$changed"
+          blocked=$(echo "$changed" | grep -E "$OFF_LIMITS" || true)
+          if [ -n "$blocked" ]; then
+            gh pr edit "$PR" --add-label needs-human
+            gh pr merge "$PR" --disable-auto || true
+            fence='```'
+            gh pr comment "$PR" --body "$(printf '🛑 **Guard:** this PR touches paths only a human may change:\n\n%s\n%s\n%s\nAuto-merge disabled.' "$fence" "$blocked" "$fence")"
+            exit 1
+          fi
+
+  review:
+    needs: guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      verdict: ${{ steps.verdict.outputs.verdict }}
+      rounds: ${{ steps.verdict.outputs.rounds }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements-dev.txt
+
+      - name: Prepare inputs
+        run: |
+          mkdir -p .agent
+          gh pr view "$PR" --json title,body \
+            --template '# PR #'"$PR"': {{.title}}{{"\n\n"}}{{.body}}{{"\n"}}' > .agent/pr.md
+          for n in $(gh pr view "$PR" --json closingIssuesReferences --jq '.closingIssuesReferences[].number'); do
+            gh issue view "$n" --json number,title,body \
+              --template '{{"\n"}}## Linked issue #{{.number}}: {{.title}}{{"\n\n"}}{{.body}}{{"\n"}}' >> .agent/pr.md
+          done
+          gh pr diff "$PR" > .agent/diff.patch
+
+      - name: Load prompt (from main, so a PR can't rewrite its own reviewer)
+        id: prompt
+        run: |
+          git fetch origin main
+          {
+            echo "text<<PROMPT_EOF"
+            git show origin/main:.github/agents/reviewer.md
+            echo "PROMPT_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Run reviewer agent
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ secrets.AGENT_GH_TOKEN }}
+          prompt: ${{ steps.prompt.outputs.text }}
+          claude_args: >-
+            --max-turns 25
+            --allowedTools "Read,Glob,Grep,Edit(./.agent/**),Bash(pytest *),Bash(ruff check *),Bash(ruff format --check *),Bash(git diff *),Bash(git log *),Bash(git show *)"
+
+      - name: Make sure the reviewer changed nothing but .agent/
+        run: |
+          dirty=$(git status --porcelain --untracked-files=all | grep -v ' \.agent/' || true)
+          if [ -n "$dirty" ]; then echo "Reviewer modified source files:"; echo "$dirty"; exit 1; fi
+
+      - name: Read verdict and post review
+        id: verdict
+        run: |
+          verdict=$(cat .agent/verdict.txt 2>/dev/null | tr -d '[:space:]' || true)
+          if [ "$verdict" != "APPROVE" ]; then verdict="REQUEST_CHANGES"; fi
+          [ -s .agent/review.md ] || echo "Reviewer produced no review text." > .agent/review.md
+          rounds=$(gh pr view "$PR" --json commits \
+            --jq '[.commits[] | select(.messageHeadline | startswith("Address review:"))] | length')
+          icon=$([ "$verdict" = "APPROVE" ] && echo "✅" || echo "🔁")
+          { echo "<!-- agent-review -->"; echo "## $icon Reviewer agent: \`$verdict\` (fix round $rounds/$MAX_FIX_ROUNDS)"; echo; cat .agent/review.md; } > .agent/comment.md
+          gh pr comment "$PR" --body-file .agent/comment.md
+          echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
+          echo "rounds=$rounds" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: review-${{ github.run_id }}
+          path: .agent/review.md
+          include-hidden-files: true
+
+  fix:
+    needs: review
+    if: needs.review.outputs.verdict == 'REQUEST_CHANGES' && fromJSON(needs.review.outputs.rounds) < 3
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          token: ${{ secrets.AGENT_GH_TOKEN }}
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements-dev.txt
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: review-${{ github.run_id }}
+          path: .agent
+
+      - name: Prepare inputs
+        id: prompt
+        run: |
+          git config user.name "coder-agent"
+          git config user.email "coder-agent@users.noreply.github.com"
+          gh pr diff "$PR" > .agent/diff.patch
+          git fetch origin main
+          {
+            echo "text<<PROMPT_EOF"
+            git show origin/main:.github/agents/fixer.md
+            echo "PROMPT_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Run coder agent (fix mode)
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ secrets.AGENT_GH_TOKEN }}
+          prompt: ${{ steps.prompt.outputs.text }}
+          claude_args: >-
+            --max-turns 30
+            --allowedTools "Read,Edit,Write,Glob,Grep,Bash(git *),Bash(pytest *),Bash(ruff *),Bash(python *)"
+
+  escalate:
+    needs: review
+    if: needs.review.outputs.verdict == 'REQUEST_CHANGES' && fromJSON(needs.review.outputs.rounds) >= 3
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - run: |
+          gh pr edit "$PR" --repo "$GITHUB_REPOSITORY" --add-label needs-human
+          gh pr merge "$PR" --repo "$GITHUB_REPOSITORY" --disable-auto || true
+          gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" \
+            --body "🙋 Reviewer still unhappy after $MAX_FIX_ROUNDS fix rounds. Handing to a human; auto-merge disabled."
+
+  # The required status check. Green only when the guard passed AND the reviewer approved.
+  agent-review:
+    needs: [guard, review]
+    if: always() && startsWith(github.head_ref, 'agent/')
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - env:
+          GUARD: ${{ needs.guard.result }}
+          VERDICT: ${{ needs.review.outputs.verdict }}
+        run: |
+          echo "guard=$GUARD verdict=$VERDICT"
+          [ "$GUARD" = "success" ] && [ "$VERDICT" = "APPROVE" ]
