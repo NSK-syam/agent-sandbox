@@ -25,3 +25,23 @@ def test_complete_and_pending():
 def test_remove_unknown_id_raises():
     with pytest.raises(KeyError):
         TodoList().remove(42)
+
+
+def test_rename_updates_title():
+    todos = TodoList()
+    task = todos.add("a")
+    renamed = todos.rename(task.id, "b")
+    assert renamed.title == "b"
+    assert todos.all()[0].title == "b"
+
+
+def test_rename_rejects_blank_title():
+    todos = TodoList()
+    task = todos.add("a")
+    with pytest.raises(ValueError):
+        todos.rename(task.id, "   ")
+
+
+def test_rename_unknown_id_raises():
+    with pytest.raises(KeyError):
+        TodoList().rename(42, "b")
