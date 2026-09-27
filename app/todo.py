@@ -31,6 +31,14 @@ class TodoList:
         task.done = True
         return task
 
+    def rename(self, task_id: int, new_title: str) -> Task:
+        task = self._get(task_id)
+        new_title = new_title.strip()
+        if not new_title:
+            raise ValueError("title must not be empty")
+        task.title = new_title
+        return task
+
     def remove(self, task_id: int) -> None:
         self._get(task_id)
         del self._tasks[task_id]
