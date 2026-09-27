@@ -43,6 +43,12 @@ class TodoList:
         self._get(task_id)
         del self._tasks[task_id]
 
+    def clear_completed(self) -> int:
+        done_ids = [task_id for task_id, task in self._tasks.items() if task.done]
+        for task_id in done_ids:
+            del self._tasks[task_id]
+        return len(done_ids)
+
     def all(self) -> list[Task]:
         return list(self._tasks.values())
 
