@@ -17,7 +17,6 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  GH_TOKEN: ${{ secrets.AGENT_GH_TOKEN }}
   PR: ${{ github.event.pull_request.number }}
   BASE_SHA: ${{ github.event.pull_request.base.sha }}
   HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -33,6 +32,21 @@ jobs:
     permissions:
       contents: read
     steps:
+      - name: Get agent identity (GitHub App token)
+        id: app
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.AGENT_APP_ID }}
+          private-key: ${{ secrets.AGENT_APP_PRIVATE_KEY }}
+      - name: Act as the agent bot
+        env:
+          TOKEN: ${{ steps.app.outputs.token }}
+          SLUG: ${{ steps.app.outputs.app-slug }}
+        run: |
+          echo "GH_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+          uid=$(GH_TOKEN="$TOKEN" gh api "/users/${SLUG}%5Bbot%5D" --jq .id)
+          echo "AGENT_NAME=${SLUG}[bot]" >> "$GITHUB_ENV"
+          echo "AGENT_EMAIL=${uid}+${SLUG}[bot]@users.noreply.github.com" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
@@ -61,6 +75,21 @@ jobs:
       verdict: ${{ steps.verdict.outputs.verdict }}
       rounds: ${{ steps.verdict.outputs.rounds }}
     steps:
+      - name: Get agent identity (GitHub App token)
+        id: app
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.AGENT_APP_ID }}
+          private-key: ${{ secrets.AGENT_APP_PRIVATE_KEY }}
+      - name: Act as the agent bot
+        env:
+          TOKEN: ${{ steps.app.outputs.token }}
+          SLUG: ${{ steps.app.outputs.app-slug }}
+        run: |
+          echo "GH_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+          uid=$(GH_TOKEN="$TOKEN" gh api "/users/${SLUG}%5Bbot%5D" --jq .id)
+          echo "AGENT_NAME=${SLUG}[bot]" >> "$GITHUB_ENV"
+          echo "AGENT_EMAIL=${uid}+${SLUG}[bot]@users.noreply.github.com" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
@@ -96,7 +125,7 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          github_token: ${{ secrets.AGENT_GH_TOKEN }}
+          github_token: ${{ steps.app.outputs.token }}
           prompt: ${{ steps.prompt.outputs.text }}
           claude_args: >-
             --max-turns 25
@@ -136,10 +165,25 @@ jobs:
       contents: read
       id-token: write
     steps:
+      - name: Get agent identity (GitHub App token)
+        id: app
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.AGENT_APP_ID }}
+          private-key: ${{ secrets.AGENT_APP_PRIVATE_KEY }}
+      - name: Act as the agent bot
+        env:
+          TOKEN: ${{ steps.app.outputs.token }}
+          SLUG: ${{ steps.app.outputs.app-slug }}
+        run: |
+          echo "GH_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+          uid=$(GH_TOKEN="$TOKEN" gh api "/users/${SLUG}%5Bbot%5D" --jq .id)
+          echo "AGENT_NAME=${SLUG}[bot]" >> "$GITHUB_ENV"
+          echo "AGENT_EMAIL=${uid}+${SLUG}[bot]@users.noreply.github.com" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.head_ref }}
-          token: ${{ secrets.AGENT_GH_TOKEN }}
+          token: ${{ steps.app.outputs.token }}
           fetch-depth: 0
 
       - uses: actions/setup-python@v5
@@ -155,8 +199,8 @@ jobs:
       - name: Prepare inputs
         id: prompt
         run: |
-          git config user.name "coder-agent"
-          git config user.email "coder-agent@users.noreply.github.com"
+          git config user.name "$AGENT_NAME"
+          git config user.email "$AGENT_EMAIL"
           gh pr diff "$PR" > .agent/diff.patch
           git fetch origin main
           {
@@ -169,7 +213,7 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          github_token: ${{ secrets.AGENT_GH_TOKEN }}
+          github_token: ${{ steps.app.outputs.token }}
           prompt: ${{ steps.prompt.outputs.text }}
           claude_args: >-
             --max-turns 30
@@ -181,7 +225,23 @@ jobs:
     runs-on: ubuntu-latest
     permissions: {}
     steps:
-      - run: |
+      - name: Get agent identity (GitHub App token)
+        id: app
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.AGENT_APP_ID }}
+          private-key: ${{ secrets.AGENT_APP_PRIVATE_KEY }}
+      - name: Act as the agent bot
+        env:
+          TOKEN: ${{ steps.app.outputs.token }}
+          SLUG: ${{ steps.app.outputs.app-slug }}
+        run: |
+          echo "GH_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+          uid=$(GH_TOKEN="$TOKEN" gh api "/users/${SLUG}%5Bbot%5D" --jq .id)
+          echo "AGENT_NAME=${SLUG}[bot]" >> "$GITHUB_ENV"
+          echo "AGENT_EMAIL=${uid}+${SLUG}[bot]@users.noreply.github.com" >> "$GITHUB_ENV"
+      - name: Hand to a human
+        run: |
           gh pr edit "$PR" --repo "$GITHUB_REPOSITORY" --add-label needs-human
           gh pr merge "$PR" --repo "$GITHUB_REPOSITORY" --disable-auto || true
           gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" \

@@ -70,18 +70,37 @@ jobs:
     if: failure() && needs.smoke.result == 'failure' && !startsWith(github.event.head_commit.message, 'Revert')
     runs-on: ubuntu-latest
     permissions: {}
-    env:
-      GH_TOKEN: ${{ secrets.AGENT_GH_TOKEN }}
     steps:
+      - name: Get agent identity (GitHub App token)
+        id: app
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.AGENT_APP_ID }}
+          private-key: ${{ secrets.AGENT_APP_PRIVATE_KEY }}
+      - name: Act as the agent bot
+        env:
+          TOKEN: ${{ steps.app.outputs.token }}
+          SLUG: ${{ steps.app.outputs.app-slug }}
+        run: |
+          echo "GH_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+          uid=$(GH_TOKEN="$TOKEN" gh api "/users/${SLUG}%5Bbot%5D" --jq .id)
+          echo "AGENT_NAME=${SLUG}[bot]" >> "$GITHUB_ENV"
+          echo "AGENT_EMAIL=${uid}+${SLUG}[bot]@users.noreply.github.com" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
         with:
-          token: ${{ secrets.AGENT_GH_TOKEN }}
+          token: ${{ steps.app.outputs.token }}
           fetch-depth: 2
-      - name: Revert the bad commit (triggers a redeploy of the previous version)
+      - name: Open a revert PR and auto-merge it (CI must still pass)
         run: |
-          git config user.name "deploy-agent"
-          git config user.email "deploy-agent@users.noreply.github.com"
+          git config user.name "$AGENT_NAME"
+          git config user.email "$AGENT_EMAIL"
+          branch="revert/${GITHUB_SHA:0:7}"
+          git checkout -b "$branch"
           git revert --no-edit "$GITHUB_SHA"
-          git push origin HEAD:main
+          git push origin "$branch"
+          gh pr create --base main --head "$branch" \
+            --title "Auto-rollback: revert ${GITHUB_SHA:0:7}" \
+            --body "Smoke test failed after deploying $GITHUB_SHA. Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          gh pr merge "$branch" --auto --squash
           gh issue create --title "Auto-rollback of ${GITHUB_SHA:0:7}" --label needs-human \
-            --body "Smoke test failed after deploying $GITHUB_SHA, so it was reverted. Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            --body "Smoke test failed after deploying $GITHUB_SHA; a revert PR was opened and set to auto-merge."
