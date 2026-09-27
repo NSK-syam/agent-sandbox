@@ -45,3 +45,25 @@ def test_rename_rejects_blank_title():
 def test_rename_unknown_id_raises():
     with pytest.raises(KeyError):
         TodoList().rename(42, "b")
+
+
+def test_clear_completed_removes_done_tasks_and_returns_count():
+    todos = TodoList()
+    first = todos.add("a")
+    second = todos.add("b")
+    todos.add("c")
+    todos.complete(first.id)
+    todos.complete(second.id)
+
+    removed = todos.clear_completed()
+
+    assert removed == 2
+    assert [t.title for t in todos.all()] == ["c"]
+
+
+def test_clear_completed_with_no_done_tasks_returns_zero():
+    todos = TodoList()
+    todos.add("a")
+
+    assert todos.clear_completed() == 0
+    assert len(todos.all()) == 1
